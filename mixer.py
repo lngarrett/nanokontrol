@@ -21,7 +21,7 @@ import time
 # Logging
 # ---------------------------------------------------------------------------
 _log = logging.getLogger("nanokontrol")
-_log.setLevel(logging.DEBUG)
+_log.setLevel(logging.INFO)
 _handler = logging.StreamHandler()
 _handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
 _log.addHandler(_handler)

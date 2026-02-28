@@ -8,6 +8,7 @@ No compiled dependencies — works on immutable OSes like Bazzite out of the box
 """
 
 import json
+import logging
 import os
 import re
 import signal
@@ -15,6 +16,15 @@ import subprocess
 import sys
 import threading
 import time
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+_log = logging.getLogger("nanokontrol")
+_log.setLevel(logging.DEBUG)
+_handler = logging.StreamHandler()
+_handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+_log.addHandler(_handler)
 
 # ---------------------------------------------------------------------------
 # CC mapping (confirmed from aseqdump output)
@@ -62,6 +72,9 @@ _lock = threading.Lock()
 # Last known fader position per channel. None = never touched (unknown).
 _last_fader: dict[int, int | None] = {i: None for i in range(8)}
 
+# Last known mute state per channel. None = never checked.
+_last_mute: dict[int, bool | None] = {i: None for i in range(8)}
+
 # Channels whose LEDs should flash (desynced or unknown).
 _flash_set: set[int] = set()
 
@@ -85,10 +98,6 @@ MUTE_DEBOUNCE = 0.3  # seconds
 _last_mute_time: dict[int, float] = {}
 
 
-def log(msg: str) -> None:
-    print(msg, flush=True)
-
-
 def find_midi_device() -> str | None:
     """Auto-detect nanoKONTROL2 MIDI output device (hw:X,0,0)."""
     try:
@@ -106,22 +115,26 @@ def find_midi_device() -> str | None:
     return None
 
 
-def _send_midi_cc(cc: int, value: int) -> None:
+def _send_midi_cc(cc: int, value: int) -> bool:
+    """Send a MIDI CC message. Returns True on success."""
     hex_msg = f"B0 {cc:02X} {value:02X}"
     try:
-        subprocess.run(
+        r = subprocess.run(
             ["amidi", "-p", MIDI_OUT_DEVICE, "-S", hex_msg],
             capture_output=True, timeout=1,
         )
-    except Exception:
-        pass
+        return r.returncode == 0
+    except Exception as e:
+        _log.warning("MIDI send failed (CC %d): %s", cc, e)
+        return False
 
 
-def send_led(channel_idx: int, on: bool) -> None:
-    """Set mute button LED."""
+def send_led(channel_idx: int, on: bool) -> bool:
+    """Set mute button LED. Returns True if the MIDI write succeeded."""
     cc = MUTE_LED_CCS.get(channel_idx)
     if cc is not None:
-        _send_midi_cc(cc, 127 if on else 0)
+        return _send_midi_cc(cc, 127 if on else 0)
+    return False
 
 
 def send_sync_led(channel_idx: int, on: bool) -> None:
@@ -145,6 +158,16 @@ def get_volume(target: str) -> float | None:
     result = wpctl("get-volume", target)
     m = re.search(r"Volume:\s+([\d.]+)", result.stdout)
     return float(m.group(1)) if m else None
+
+
+def get_volume_and_mute(target: str) -> tuple[float | None, bool | None]:
+    """Get volume and mute state from a single wpctl call."""
+    result = wpctl("get-volume", target)
+    stdout = result.stdout
+    m = re.search(r"Volume:\s+([\d.]+)", stdout)
+    if not m:
+        return None, None
+    return float(m.group(1)), "[MUTED]" in stdout
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +216,7 @@ def refresh_nodes() -> None:
                     description=props.get("node.description", ""),
                 ))
     except Exception as e:
-        log(f"  node lookup failed: {e}")
+        _log.warning("node lookup failed: %s", e)
 
 
 def resolve_targets(channel: int) -> list[str]:
@@ -226,6 +249,7 @@ def resolve_targets(channel: int) -> list[str]:
                 if any(ex in n.media_name for ex in match["exclude_media"]):
                     continue
             results.append(str(n.node_id))
+        _log.debug("[%s] resolved %d node(s)", ch["label"], len(results))
         return results
     return []
 
@@ -239,10 +263,14 @@ def set_volume(channel: int, midi_value: int) -> None:
         _flash_set.discard(channel)
     targets = resolve_targets(channel)
     if not targets:
+        _log.warning("[%s] set_volume: no targets resolved", CHANNELS[channel]["label"])
         return
     vol = f"{midi_value / 127.0:.3f}"
     for target in targets:
-        wpctl("set-volume", target, vol)
+        r = wpctl("set-volume", target, vol)
+        if r.returncode != 0:
+            _log.warning("[%s] wpctl set-volume failed (rc=%d): %s",
+                         CHANNELS[channel]["label"], r.returncode, r.stderr.strip())
 
 
 def queue_volume(channel: int, midi_value: int) -> None:
@@ -268,24 +296,39 @@ def fader_worker() -> None:
 
 
 def toggle_mute(channel: int) -> None:
+    label = CHANNELS[channel]["label"]
     targets = resolve_targets(channel)
     if not targets:
+        _log.warning("[%s] toggle_mute: no targets resolved", label)
         return
     for target in targets:
-        wpctl("set-mute", target, "toggle")
-    # Read back actual state to set LED correctly
+        r = wpctl("set-mute", target, "toggle")
+        if r.returncode != 0:
+            _log.warning("[%s] wpctl set-mute failed (rc=%d): %s",
+                         label, r.returncode, r.stderr.strip())
+    # Read back actual state — is_muted returns False on wpctl failure,
+    # which is the safe direction (won't falsely light the LED).
     now_muted = is_muted(targets[0])
     send_led(channel, now_muted)
-    ch = CHANNELS[channel]
+    # Do NOT write _last_mute here. The poller is the sole authority on
+    # _last_mute so it will unconditionally re-drive the LED on the next
+    # cycle. If our send_led just failed, the poller corrects it within 2s.
     state = "MUTED" if now_muted else "unmuted"
-    log(f"  [{ch['label']}] {state}")
+    _log.info("[%s] %s", label, state)
 
 
 # ---------------------------------------------------------------------------
 # Background threads
 # ---------------------------------------------------------------------------
 def desync_poller() -> None:
-    """Poll PipeWire volumes and flag desynced channels."""
+    """Poll PipeWire state and reconcile LEDs.
+
+    MUTE LED GUARANTEE: Every cycle, for every active channel, the mute
+    LED is unconditionally driven to match PipeWire truth. _last_mute is
+    only used to decide what to *log*, never to skip sending.  If we
+    can't read PipeWire or find the node, the LED is forced OFF (we
+    refuse to claim "muted" when we can't verify it).
+    """
     while not _shutdown.is_set():
         for idx in range(8):
             if _shutdown.is_set():
@@ -294,37 +337,52 @@ def desync_poller() -> None:
             if not ch or ch["match"] is None:
                 continue
 
+            targets = resolve_targets(idx)
+
+            # --- Read PipeWire state (one subprocess call) ---
+            pw_vol: float | None = None
+            pw_muted: bool | None = None
+            if targets:
+                pw_vol, pw_muted = get_volume_and_mute(targets[0])
+
+            # --- Mute LED (always runs, even if fader untouched) ---
+            if pw_muted is None:
+                # Can't read PipeWire or no targets — force LED off
+                send_led(idx, False)
+                with _lock:
+                    _last_mute[idx] = None
+            else:
+                # Drive LED to match PipeWire truth unconditionally
+                send_led(idx, pw_muted)
+                with _lock:
+                    prev = _last_mute[idx]
+                    _last_mute[idx] = pw_muted
+                if prev is not None and pw_muted != prev:
+                    state = "MUTED" if pw_muted else "unmuted"
+                    _log.info("[%s] mute LED resync: %s", ch["label"], state)
+
+            # --- Volume desync (only when fader has been touched) ---
             with _lock:
                 last = _last_fader[idx]
 
             if last is None:
-                # Never touched — unknown state, flash
                 with _lock:
                     _flash_set.add(idx)
                 continue
 
-            targets = resolve_targets(idx)
             if not targets:
-                # Can't find the node. For persistent sinks this means
-                # pw-dump failed or PipeWire is restarting — keep current
-                # flash state, don't assume anything.
                 continue
-
-            pw_vol = get_volume(targets[0])
             if pw_vol is None:
-                # Can't read volume — don't clear flash, don't assume synced
                 with _lock:
                     _flash_set.add(idx)
                 continue
 
             actual_midi = round(pw_vol * 127)
             if abs(last - actual_midi) > DESYNC_THRESHOLD:
-                # Auto-resync: apply saved fader position to PipeWire
                 vol = f"{last / 127.0:.3f}"
                 for t in targets:
                     wpctl("set-volume", t, vol)
-                log(f"  [{CHANNELS[idx]['label']}] auto-resynced to {int(last / 127 * 100)}%")
-                # Verify it actually took
+                _log.info("[%s] auto-resynced to %d%%", ch["label"], int(last / 127 * 100))
                 verify = get_volume(targets[0])
                 if verify is not None:
                     verify_midi = round(verify * 127)
@@ -334,9 +392,7 @@ def desync_poller() -> None:
                     else:
                         with _lock:
                             _flash_set.add(idx)
-                # If verify failed, leave flash state unchanged — next cycle retries
             else:
-                # Confirmed in sync
                 with _lock:
                     _flash_set.discard(idx)
 
@@ -364,36 +420,19 @@ def led_flasher() -> None:
         _shutdown.wait(FLASH_RATE)
 
 
-def sync_leds() -> None:
-    """Set non-flashing channel LEDs to actual PipeWire mute state."""
-    for idx in range(8):
-        with _lock:
-            if idx in _flash_set:
-                continue
-        targets = resolve_targets(idx)
-        if targets:
-            muted = is_muted(targets[0])
-            send_led(idx, muted)
-        else:
-            send_led(idx, False)
-    log("  LEDs synced with PipeWire state")
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
     global MIDI_OUT_DEVICE
-    log("nanokontrol mixer starting...")
-    log("")
+    _log.info("nanokontrol mixer starting")
 
     for idx, ch in sorted(CHANNELS.items()):
         status = "ACTIVE" if ch["match"] is not None else "---"
-        log(f"  Fader {idx + 1}: {ch['label']:<20} [{status}]")
-    log("")
+        _log.info("Fader %d: %-20s [%s]", idx + 1, ch["label"], status)
 
     # Auto-detect MIDI output device, wait if not plugged in yet
-    log("  Waiting for nanoKONTROL2...")
+    _log.info("Waiting for nanoKONTROL2...")
     while not _shutdown.is_set():
         MIDI_OUT_DEVICE = find_midi_device()
         if MIDI_OUT_DEVICE:
@@ -401,7 +440,7 @@ def main() -> None:
         time.sleep(2)
     if _shutdown.is_set():
         return
-    log(f"  Found MIDI device: {MIDI_OUT_DEVICE}")
+    _log.info("Found MIDI device: %s", MIDI_OUT_DEVICE)
 
     # Mark all active channels as unknown (flash until touched)
     with _lock:
@@ -417,7 +456,7 @@ def main() -> None:
     flasher.start()
     fworker.start()
 
-    log("  LEDs flashing — touch each fader to sync")
+    _log.info("LEDs flashing — touch each fader to sync")
 
     proc = subprocess.Popen(
         ["aseqdump", "-p", "nanoKONTROL2"],
@@ -426,7 +465,7 @@ def main() -> None:
     )
 
     def shutdown(signum, frame):
-        log("\nShutting down...")
+        _log.info("Shutting down...")
         _shutdown.set()
         for idx in range(8):
             send_led(idx, False)
@@ -437,8 +476,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    log("Listening on nanoKONTROL2...")
-    log("")
+    _log.info("Listening on nanoKONTROL2...")
 
     buf = b""
     fd = proc.stdout.fileno()
@@ -466,7 +504,7 @@ def main() -> None:
                 if ch and ch["match"] is not None:
                     queue_volume(fader_idx, value)
                     pct = int(value / 127 * 100)
-                    log(f"  [{ch['label']}] {pct}%")
+                    _log.info("[%s] %d%%", ch["label"], pct)
 
             elif controller in MUTE_CCS and value == 127:
                 mute_idx = MUTE_CCS[controller]

@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import select
 import signal
 import subprocess
 import sys
@@ -145,7 +146,12 @@ def send_sync_led(channel_idx: int, on: bool) -> None:
 
 
 def wpctl(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["wpctl", *args], capture_output=True, text=True, timeout=2)
+    try:
+        return subprocess.run(["wpctl", *args], capture_output=True, text=True, timeout=2)
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError) as e:
+        _log.debug("wpctl command failed (%s): %s", args, e)
+        # Return a dummy object with non-zero returncode to signal failure
+        return subprocess.CompletedProcess(args=list(args), returncode=1, stdout="", stderr=str(e))
 
 
 def is_muted(target: str) -> bool:
@@ -323,11 +329,8 @@ def toggle_mute(channel: int) -> None:
 def desync_poller() -> None:
     """Poll PipeWire state and reconcile LEDs.
 
-    MUTE LED GUARANTEE: Every cycle, for every active channel, the mute
-    LED is unconditionally driven to match PipeWire truth. _last_mute is
-    only used to decide what to *log*, never to skip sending.  If we
-    can't read PipeWire or find the node, the LED is forced OFF (we
-    refuse to claim "muted" when we can't verify it).
+    Optimized to only drive MIDI LEDs when the state actually changes,
+    reducing USB bus traffic and preventing controller 'nuking'.
     """
     while not _shutdown.is_set():
         for idx in range(8):
@@ -345,19 +348,22 @@ def desync_poller() -> None:
             if targets:
                 pw_vol, pw_muted = get_volume_and_mute(targets[0])
 
-            # --- Mute LED (always runs, even if fader untouched) ---
+            # --- Mute LED (only drive on change) ---
+            with _lock:
+                prev_mute = _last_mute[idx]
+
             if pw_muted is None:
-                # Can't read PipeWire or no targets — force LED off
-                send_led(idx, False)
-                with _lock:
-                    _last_mute[idx] = None
+                # Can't read PipeWire or no targets
+                if prev_mute is not None:
+                    send_led(idx, False)
+                    with _lock:
+                        _last_mute[idx] = None
             else:
-                # Drive LED to match PipeWire truth unconditionally
-                send_led(idx, pw_muted)
-                with _lock:
-                    prev = _last_mute[idx]
-                    _last_mute[idx] = pw_muted
-                if prev is not None and pw_muted != prev:
+                # Drive LED only if truth differs from our last record
+                if pw_muted != prev_mute:
+                    send_led(idx, pw_muted)
+                    with _lock:
+                        _last_mute[idx] = pw_muted
                     state = "MUTED" if pw_muted else "unmuted"
                     _log.info("[%s] mute LED resync: %s", ch["label"], state)
 
@@ -431,22 +437,13 @@ def main() -> None:
         status = "ACTIVE" if ch["match"] is not None else "---"
         _log.info("Fader %d: %-20s [%s]", idx + 1, ch["label"], status)
 
-    # Auto-detect MIDI output device, wait if not plugged in yet
-    _log.info("Waiting for nanoKONTROL2...")
-    while not _shutdown.is_set():
-        MIDI_OUT_DEVICE = find_midi_device()
-        if MIDI_OUT_DEVICE:
-            break
-        time.sleep(2)
-    if _shutdown.is_set():
-        return
-    _log.info("Found MIDI device: %s", MIDI_OUT_DEVICE)
+    # Signal handling
+    def shutdown_handler(signum, frame):
+        _log.info("Shutting down...")
+        _shutdown.set()
 
-    # Mark all active channels as unknown (flash until touched)
-    with _lock:
-        for idx, ch in CHANNELS.items():
-            if ch["match"] is not None:
-                _flash_set.add(idx)
+    signal.signal(signal.SIGINT, shutdown_handler)
+    signal.signal(signal.SIGTERM, shutdown_handler)
 
     # Start background threads
     poller = threading.Thread(target=desync_poller, daemon=True)
@@ -456,62 +453,108 @@ def main() -> None:
     flasher.start()
     fworker.start()
 
-    _log.info("LEDs flashing — touch each fader to sync")
+    while not _shutdown.is_set():
+        # Auto-detect MIDI output device, wait if not plugged in yet
+        # Check if MIDI_OUT_DEVICE is still valid (exists in /dev/snd)
+        dev_num = None
+        if MIDI_OUT_DEVICE and MIDI_OUT_DEVICE.startswith("hw:"):
+            try:
+                dev_num = MIDI_OUT_DEVICE.split(",")[0][3:]
+            except Exception:
+                pass
+        
+        path_missing = dev_num is not None and not os.path.exists(f"/dev/snd/midiC{dev_num}D0")
 
-    proc = subprocess.Popen(
-        ["aseqdump", "-p", "nanoKONTROL2"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+        if not MIDI_OUT_DEVICE or path_missing:
+            new_device = find_midi_device()
+            if new_device != MIDI_OUT_DEVICE:
+                MIDI_OUT_DEVICE = new_device
+                if MIDI_OUT_DEVICE:
+                    _log.info("Found MIDI device: %s", MIDI_OUT_DEVICE)
+                    # Force a full resync of LEDs on reconnect
+                    with _lock:
+                        for i in range(8):
+                            _last_mute[i] = None
+                else:
+                    _log.info("Waiting for nanoKONTROL2...")
 
-    def shutdown(signum, frame):
-        _log.info("Shutting down...")
-        _shutdown.set()
-        for idx in range(8):
-            send_led(idx, False)
-            send_sync_led(idx, False)
-        proc.terminate()
-        sys.exit(0)
+        if not MIDI_OUT_DEVICE:
+            time.sleep(2)
+            continue
 
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
+        _log.info("Listening on nanoKONTROL2...")
+        
+        proc = subprocess.Popen(
+            ["aseqdump", "-p", "nanoKONTROL2"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
 
-    _log.info("Listening on nanoKONTROL2...")
+        # Mark all active channels as unknown (flash until touched) on start/reconnect
+        with _lock:
+            for idx, ch in CHANNELS.items():
+                if ch["match"] is not None and _last_fader[idx] is None:
+                    _flash_set.add(idx)
 
-    buf = b""
-    fd = proc.stdout.fileno()
-    while True:
+        fd = proc.stdout.fileno()
+        buf = b""
+        
         try:
-            chunk = os.read(fd, 4096)
-        except OSError:
-            break
-        if not chunk:
-            break
-        buf += chunk
-        while b"\n" in buf:
-            line_bytes, buf = buf.split(b"\n", 1)
-            line = line_bytes.decode("utf-8", errors="replace")
+            while not _shutdown.is_set():
+                if proc.poll() is not None:
+                    _log.warning("aseqdump exited unexpectedly")
+                    break
+                
+                try:
+                    r, _, _ = select.select([fd], [], [], 1.0)
+                    if not r:
+                        continue
+                    
+                    chunk = os.read(fd, 4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line_bytes, buf = buf.split(b"\n", 1)
+                        line = line_bytes.decode("utf-8", errors="replace")
 
-            m = CC_RE.search(line)
-            if not m:
-                continue
+                        m = CC_RE.search(line)
+                        if not m:
+                            continue
 
-            _ch, controller, value = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                        _ch, controller, value = int(m.group(1)), int(m.group(2)), int(m.group(3))
 
-            if controller in FADER_CCS:
-                fader_idx = FADER_CCS[controller]
-                ch = CHANNELS.get(fader_idx)
-                if ch and ch["match"] is not None:
-                    queue_volume(fader_idx, value)
-                    pct = int(value / 127 * 100)
-                    _log.info("[%s] %d%%", ch["label"], pct)
+                        if controller in FADER_CCS:
+                            fader_idx = FADER_CCS[controller]
+                            ch = CHANNELS.get(fader_idx)
+                            if ch and ch["match"] is not None:
+                                queue_volume(fader_idx, value)
+                                pct = int(value / 127 * 100)
+                                _log.info("[%s] %d%%", ch["label"], pct)
 
-            elif controller in MUTE_CCS and value == 127:
-                mute_idx = MUTE_CCS[controller]
-                now = time.monotonic()
-                if now - _last_mute_time.get(mute_idx, 0) >= MUTE_DEBOUNCE:
-                    _last_mute_time[mute_idx] = now
-                    toggle_mute(mute_idx)
+                        elif controller in MUTE_CCS and value == 127:
+                            mute_idx = MUTE_CCS[controller]
+                            now = time.monotonic()
+                            if now - _last_mute_time.get(mute_idx, 0) >= MUTE_DEBOUNCE:
+                                _last_mute_time[mute_idx] = now
+                                toggle_mute(mute_idx)
+                except Exception as e:
+                    _log.error("Error reading MIDI: %s", e)
+                    break
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+            _log.info("MIDI listener stopped")
+
+        if not _shutdown.is_set():
+            _log.info("Attempting to reconnect in 2s...")
+            time.sleep(2)
+
+    # Final cleanup
+    for idx in range(8):
+        send_led(idx, False)
+        send_sync_led(idx, False)
+    _log.info("Mixer exit.")
 
 
 if __name__ == "__main__":
